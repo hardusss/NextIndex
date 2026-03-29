@@ -3,7 +3,7 @@ import { Program, AnchorProvider, Idl } from '@coral-xyz/anchor';
 import { Connection, PublicKey } from '@solana/web3.js';
 import * as fs from "fs/promises";
 
-export default async function loadIDL(): Promise<Idl> {
+export async function loadIDL(): Promise<Idl> {
     const idlAddress = process.env.IDL_ADDRESS;
 
     // If .env have IDL_ADDRESS we start download from network 
