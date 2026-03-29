@@ -7,7 +7,7 @@ import {
     mysqlTable,
 } from "drizzle-orm/mysql-core";
 
-export const trasactions = mysqlTable("trasactions", {
+export const transactions = mysqlTable("transactions", {
     signature: varchar({ length: 100 }).primaryKey(),
     slot: bigint("slot", { mode: "number", unsigned: true }),
     signer: varchar({ length: 100 }),
