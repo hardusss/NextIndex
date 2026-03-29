@@ -13,7 +13,14 @@ type DbRecord = {
     timestamp: Date;
 };
 
-
+/**
+ * Indexes transactions of a specific Solana program by polling the RPC node,
+ * decoding instruction data via Anchor's BorshInstructionCoder, and persisting
+ * the results to a MySQL database.
+ *
+ * Tracks the last seen signature in memory to avoid re-processing already
+ * indexed transactions on each polling cycle.
+ */
 export class SolanaIndexer {
     private connection: Connection;
     private programId: PublicKey;
@@ -21,13 +28,27 @@ export class SolanaIndexer {
 
     private lastSignature: string | undefined = undefined;
 
+    /**
+     * @param rpcUrl - Solana RPC endpoint URL
+     * @param programIdStr - Base58-encoded public key of the program to index
+     * @param idl - Anchor IDL used to decode instruction data
+     */
     constructor(rpcUrl: string, programIdStr: string, idl: Idl) {
         this.connection = new Connection(rpcUrl, "confirmed");
         this.programId = new PublicKey(programIdStr);
-
         this.coder = new BorshInstructionCoder(idl);
     };
 
+    /**
+     * Fetches and processes new transactions since the last polling cycle.
+     *
+     * Uses `getSignaturesForAddress` with `until: lastSignature` to paginate
+     * only new signatures. After fetching, updates `lastSignature` to the most
+     * recent one so the next call starts from where this one left off.
+     *
+     * A 150ms delay between individual transaction fetches is intentional —
+     * it prevents hitting public RPC rate limits (429 errors).
+     */
     public async fetchNewTransactions() {
         try {
             const options: any = { limit: 50 };
@@ -72,6 +93,22 @@ export class SolanaIndexer {
         };
     };
 
+    /**
+     * Decodes a single parsed transaction and writes matching instructions to the DB.
+     *
+     * Iterates over all instructions in the transaction message. Only processes
+     * instructions that belong to the indexed program and contain raw `data` field
+     * (as opposed to parsed instructions returned by the RPC for known programs).
+     *
+     * Anchor encodes instruction data as base58. The first 8 bytes are a discriminator
+     * that identifies which instruction it is — `BorshInstructionCoder.decode()` handles
+     * this automatically using the IDL.
+     *
+     * Non-JSON-serializable values (BN numbers, PublicKeys, Buffers) are normalized
+     * via a custom JSON replacer before being stored.
+     *
+     * @param tx - Full parsed transaction with metadata from the RPC
+     */
     private async decodeTransaction(tx: ParsedTransactionWithMeta) {
         const signature = tx.transaction.signatures[0];
         const message = tx.transaction.message;
@@ -90,18 +127,16 @@ export class SolanaIndexer {
 
                             const safeJsonData = JSON.parse(
                                 JSON.stringify(decoded.data, (key, value) => {
-                                    if (value && value.type === "Buffer") return value.data; // If this buffer
-                                    if (value && value.toNumber) return value.toString(); // Convert objects BN into strings
-                                    if (value && value.toBase58) return value.toBase58(); // If have PublicKey
+                                    if (value && value.type === "Buffer") return value.data;
+                                    if (value && value.toNumber) return value.toString();
+                                    if (value && value.toBase58) return value.toBase58();
                                     return value;
                                 })
                             );
 
-                            // Get singer
                             const signerAccount = tx.transaction.message.accountKeys.find(acc => acc.signer);
                             const signerAddress = signerAccount ? signerAccount.pubkey.toBase58() : "UNKNOWN";
 
-                            // Format object
                             const dbRecordData = {
                                 signature: signature,
                                 slot: tx.slot,
@@ -110,7 +145,7 @@ export class SolanaIndexer {
                                 decoded_data: safeJsonData,
                                 timestamp: tx.blockTime ? new Date(tx.blockTime * 1000) : new Date(),
                             };
-                            await this.writeToDB(dbRecordData)
+                            await this.writeToDB(dbRecordData);
                         }
                     } catch (e) {
                         console.error(`[Indexer] Error parse instruction ${signature}`);
@@ -120,11 +155,18 @@ export class SolanaIndexer {
         };
     };
 
+    /**
+     * Persists a decoded transaction record to the database.
+     *
+     * Uses Drizzle's `$inferInsert` to ensure the shape matches the schema exactly.
+     * Duplicate signatures are silently ignored at the DB level via the primary key constraint.
+     *
+     * @param data - Normalized transaction record ready for insertion
+     * @returns `true` if the write succeeded, `false` otherwise
+     */
     private async writeToDB(data: DbRecord): Promise<boolean> {
-        // Format data
         const transaction: typeof transactions.$inferInsert = data;
 
-        // Write
         try {
             await db.insert(transactions).values(transaction);
             return true;
@@ -132,6 +174,5 @@ export class SolanaIndexer {
             console.error("[Indexer] Error write data into db");
             return false;
         }
-
     }
 };
